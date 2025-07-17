@@ -28,6 +28,7 @@ function AppContent() {
     dashboardStats,
     alerts,
     loading,
+    isRecalculating,
     addRegisterSales,
     addProduct,
     addProducts,
@@ -91,6 +92,7 @@ function AppContent() {
             products={products}
             registerSales={registerSales}
             loading={loading}
+            isRecalculating={isRecalculating}
             onAddProduct={addProduct}
             onAddProducts={addProducts}
             onUpdateProduct={updateProduct}

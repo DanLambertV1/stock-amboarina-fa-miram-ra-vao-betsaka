@@ -11,7 +11,9 @@ import {
   where,
   onSnapshot,
   writeBatch,
-  Timestamp
+  Timestamp,
+  limit,
+  startAfter
 } from 'firebase/firestore';
 import { db, COLLECTIONS, FirestoreRegisterSale, FirestoreProduct } from '../lib/firebase';
 import { RegisterSale, Product, DashboardStats, Alert } from '../types';
@@ -24,6 +26,7 @@ export function useFirebaseData() {
   const [dashboardStats, setDashboardStats] = useState<DashboardStats | null>(null);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [loading, setLoading] = useState(true);
+  const [isRecalculating, setIsRecalculating] = useState(false);
 
   // Load initial data
   useEffect(() => {
@@ -33,18 +36,24 @@ export function useFirebaseData() {
   // ✅ CRITICAL FIX: Recalculate product quantities whenever sales data changes
   useEffect(() => {
     if (registerSales.length >= 0 && products.length > 0) { // Changed condition to include 0 sales
-      console.log(`🔄 Sales data changed (${registerSales.length} sales) - triggering stock recalculation...`);
-      recalculateProductQuantities();
+      // Debounce recalculation to prevent multiple rapid updates
+      const timer = setTimeout(() => {
+        console.log(`🔄 Sales data changed (${registerSales.length} sales) - triggering stock recalculation...`);
+        recalculateProductQuantities();
+      }, 300);
+      
+      return () => clearTimeout(timer);
     }
   }, [registerSales.length, products.length]); // Trigger on both sales and products changes
 
   const loadInitialData = async () => {
     setLoading(true);
     try {
-      await Promise.all([
-        loadRegisterSales(),
-        loadProducts()
-      ]);
+      // Load products first as they're needed for the UI
+      await loadProducts();
+      
+      // Then load sales data (which can be larger)
+      loadRegisterSales();
     } catch (error) {
       console.error('Erreur lors du chargement des données:', error);
     } finally {
@@ -55,30 +64,45 @@ export function useFirebaseData() {
   const loadRegisterSales = async () => {
     try {
       const salesCollection = collection(db, COLLECTIONS.REGISTER_SALES);
-      const salesQuery = query(salesCollection, orderBy('date', 'desc'));
+      // Limit initial query to most recent 500 sales for faster loading
+      const salesQuery = query(
+        salesCollection, 
+        orderBy('date', 'desc'),
+        limit(500)
+      );
       
-      const querySnapshot = await getDocs(salesQuery);
-      const sales: RegisterSale[] = [];
-      
-      querySnapshot.forEach((doc) => {
-        const data = doc.data() as FirestoreRegisterSale;
-        sales.push({
-          id: doc.id,
-          product: data.product,
-          category: data.category,
-          register: data.register,
-          date: parseISO(data.date),
-          seller: data.seller,
-          quantity: data.quantity,
-          price: data.price,
-          total: data.total,
-          created_at: data.createdAt ? parseISO(data.createdAt) : new Date()
+      // Use onSnapshot for real-time updates instead of one-time fetch
+      return onSnapshot(salesQuery, (snapshot) => {
+        const sales: RegisterSale[] = [];
+        
+        snapshot.forEach((doc) => {
+          const data = doc.data() as FirestoreRegisterSale;
+          sales.push({
+            id: doc.id,
+            product: data.product,
+            category: data.category,
+            register: data.register,
+            date: parseISO(data.date),
+            seller: data.seller,
+            quantity: data.quantity,
+            price: data.price,
+            total: data.total,
+            created_at: data.createdAt ? parseISO(data.createdAt) : new Date()
+          });
         });
-      });
 
-      console.log(`📊 Loaded ${sales.length} sales from Firebase`);
-      setRegisterSales(sales);
-      calculateDashboardStats(sales);
+        console.log(`📊 Loaded ${sales.length} sales from Firebase`);
+        setRegisterSales(sales);
+        calculateDashboardStats(sales);
+        setLoading(false);
+      }, (error) => {
+        console.error('Error loading sales:', error);
+        // Fallback to mock data
+        const mockSales = generateMockSales();
+        setRegisterSales(mockSales);
+        calculateDashboardStats(mockSales);
+        setLoading(false);
+      });
     } catch (error) {
       console.error('Erreur lors du chargement des ventes:', error);
       // Fallback to mock data
@@ -91,32 +115,40 @@ export function useFirebaseData() {
   const loadProducts = async () => {
     try {
       const productsCollection = collection(db, COLLECTIONS.PRODUCTS);
-      const productsQuery = query(productsCollection, orderBy('name'));
+      // Use onSnapshot for real-time updates
+      return onSnapshot(
+        query(productsCollection, orderBy('name')),
+        (snapshot) => {
+          const products: Product[] = [];
+          
+          snapshot.forEach((doc) => {
+            const data = doc.data() as FirestoreProduct;
+            products.push({
+              id: doc.id,
+              name: data.name,
+              category: data.category,
+              price: data.price,
+              stock: data.stock,
+              initialStock: data.initialStock || data.stock,
+              initialStockDate: data.initialStockDate,
+              quantitySold: data.quantitySold || 0,
+              minStock: data.minStock,
+              description: data.description
+            });
+          });
       
-      const querySnapshot = await getDocs(productsQuery);
-      const products: Product[] = [];
-      
-      querySnapshot.forEach((doc) => {
-        const data = doc.data() as FirestoreProduct;
-        products.push({
-          id: doc.id,
-          name: data.name,
-          category: data.category,
-          price: data.price,
-          stock: data.stock,
-          initialStock: data.initialStock || data.stock,
-          initialStockDate: data.initialStockDate,
-          quantitySold: data.quantitySold || 0,
-          minStock: data.minStock,
-          description: data.description
+          console.log(`📦 Loaded ${products.length} products from Firebase`);
+          setProducts(products);
+        },
+        (error) => {
+          console.error('Error loading products:', error);
+          setProducts(generateMockProducts());
+          setLoading(false);
         });
-      });
-
-      console.log(`📦 Loaded ${products.length} products from Firebase`);
-      setProducts(products);
     } catch (error) {
       console.error('Erreur lors du chargement des produits:', error);
       setProducts(generateMockProducts());
+      setLoading(false);
     }
   };
 
@@ -367,37 +399,63 @@ export function useFirebaseData() {
   // ✅ ENHANCED: Recalculate all product quantities based on current sales
   const recalculateProductQuantities = async () => {
     console.log(`🔄 Starting stock recalculation with ${registerSales.length} sales and ${products.length} products...`);
+    setIsRecalculating(true);
     
     if (products.length === 0) {
       console.log('⚠️ No products available for recalculation');
+      setIsRecalculating(false);
       return;
     }
     
-    // ✅ ENHANCED: Use the new stock calculation system
-    const updatedProducts = products.map(product => {
-      const calculation = calculateStockFinal(product, registerSales);
+    // Process products in chunks to avoid UI freezing
+    const CHUNK_SIZE = 50;
+    const productChunks = [];
+    
+    for (let i = 0; i < products.length; i += CHUNK_SIZE) {
+      productChunks.push(products.slice(i, i + CHUNK_SIZE));
+    }
+    
+    const updatedProducts = [...products];
+    
+    // Process each chunk with a small delay between chunks
+    for (let i = 0; i < productChunks.length; i++) {
+      const chunk = productChunks[i];
       
-      // Ensure we have an initial stock value
-      const initialStock = product.initialStock || product.stock + (product.quantitySold || 0);
+      // Use setTimeout to yield to the main thread between chunks
+      await new Promise<void>(resolve => {
+        setTimeout(() => {
+          chunk.forEach((product, productIndex) => {
+            const actualIndex = i * CHUNK_SIZE + productIndex;
+            const calculation = calculateStockFinal(product, registerSales);
+            
+            // Ensure we have an initial stock value
+            const initialStock = product.initialStock || product.stock + (product.quantitySold || 0);
+            
+            // Use calculated values from the new system
+            const totalQuantitySold = calculation.validSales.reduce((sum, sale) => sum + sale.quantity, 0);
+            const finalStock = calculation.finalStock;
+            
+            updatedProducts[actualIndex] = {
+              ...product,
+              initialStock,
+              quantitySold: totalQuantitySold,
+              stock: finalStock
+            };
+            
+            // Log significant changes
+            if (product.quantitySold !== totalQuantitySold || product.stock !== finalStock) {
+              console.log(`📦 ${product.name}: Sold ${product.quantitySold || 0} → ${totalQuantitySold}, Stock ${product.stock} → ${finalStock}`);
+            }
+          });
+          resolve();
+        }, 0);
+      });
       
-      // Use calculated values from the new system
-      const totalQuantitySold = calculation.validSales.reduce((sum, sale) => sum + sale.quantity, 0);
-      const finalStock = calculation.finalStock;
-      
-      const updated = {
-        ...product,
-        initialStock,
-        quantitySold: totalQuantitySold,
-        stock: finalStock
-      };
-
-      // Log significant changes
-      if (product.quantitySold !== totalQuantitySold || product.stock !== finalStock) {
-        console.log(`📦 ${product.name}: Sold ${product.quantitySold || 0} → ${totalQuantitySold}, Stock ${product.stock} → ${finalStock}`);
+      // Update progress every chunk
+      if (i % 2 === 0 || i === productChunks.length - 1) {
+        console.log(`Progress: ${Math.min(100, Math.round(((i + 1) / productChunks.length) * 100))}%`);
       }
-
-      return updated;
-    });
+    }
 
     // ✅ CRITICAL: Update local state immediately
     setProducts(updatedProducts);
@@ -436,9 +494,10 @@ export function useFirebaseData() {
     }
 
     // Regenerate alerts after stock changes
-    await generateAlerts();
+    generateAlerts();
     
     console.log('✅ Stock recalculation completed');
+    setIsRecalculating(false);
   };
 
   const calculateDashboardStats = (sales: RegisterSale[]) => {
@@ -1005,6 +1064,7 @@ export function useFirebaseData() {
     dashboardStats,
     alerts,
     loading,
+    isRecalculating,
     addRegisterSales,
     addProduct,
     addProducts, // ✅ NEW: Batch add products

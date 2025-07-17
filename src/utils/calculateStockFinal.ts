@@ -1,5 +1,5 @@
 import { Product, RegisterSale } from '../types';
-import { format, parseISO, isAfter, isBefore, startOfDay } from 'date-fns';
+import { format, parseISO, isAfter, isBefore, startOfDay, isValid } from 'date-fns';
 
 export interface StockCalculationResult {
   finalStock: number;
@@ -23,12 +23,32 @@ export function calculateStockFinal(
   product: Product, 
   allSales: RegisterSale[]
 ): StockCalculationResult {
+  // Early return for performance if no sales
+  if (allSales.length === 0) {
+    return {
+      finalStock: product.initialStock || 0,
+      validSales: [],
+      ignoredSales: [],
+      hasInconsistentStock: false
+    };
+  }
+
   // Default values
   const initialStock = product.initialStock || 0;
   const initialStockDate = product.initialStockDate;
   
   // Find all sales for this product
-  const productSales = findProductSales(product, allSales);
+  const productSales = findProductSalesOptimized(product, allSales);
+  
+  // Early return if no product sales found
+  if (productSales.length === 0) {
+    return {
+      finalStock: initialStock,
+      validSales: [],
+      ignoredSales: [],
+      hasInconsistentStock: false
+    };
+  }
   
   // If no initial stock date is set, use all sales (legacy behavior)
   if (!initialStockDate) {
@@ -42,7 +62,18 @@ export function calculateStockFinal(
   }
   
   // Parse the initial stock date
-  const stockDate = parseISO(initialStockDate);
+  let stockDate: Date;
+  try {
+    stockDate = parseISO(initialStockDate);
+    if (!isValid(stockDate)) {
+      // Fallback to current date if invalid
+      stockDate = new Date();
+    }
+  } catch (error) {
+    // Fallback to current date if parsing fails
+    stockDate = new Date();
+  }
+  
   const stockDateStart = startOfDay(stockDate);
   
   // Separate sales before and after the stock date
@@ -82,30 +113,38 @@ export function calculateStockFinal(
 /**
  * Find all sales that match a specific product
  */
-function findProductSales(product: Product, allSales: RegisterSale[]): RegisterSale[] {
+function findProductSalesOptimized(product: Product, allSales: RegisterSale[]): RegisterSale[] {
   const normalizeString = (str: string) => 
     str.toLowerCase().trim().replace(/\s+/g, ' ');
 
   const normalizedProductName = normalizeString(product.name);
   const normalizedProductCategory = normalizeString(product.category);
+  
+  // Create a product signature for faster matching
+  const productSignature = `${normalizedProductName}|${normalizedProductCategory}`;
 
+  // First pass: exact match using signature (much faster)
+  const exactMatches = allSales.filter(sale => {
+    const normalizedSaleName = normalizeString(sale.product);
+    const normalizedSaleCategory = normalizeString(sale.category);
+    const saleSignature = `${normalizedSaleName}|${normalizedSaleCategory}`;
+    
+    return saleSignature === productSignature;
+  });
+  
+  // If we found exact matches, return them immediately
+  if (exactMatches.length > 0) {
+    return exactMatches;
+  }
+  
+  // Second pass: fuzzy match only if no exact matches found
   return allSales.filter(sale => {
     const normalizedSaleName = normalizeString(sale.product);
     const normalizedSaleCategory = normalizeString(sale.category);
     
-    // Exact match first
-    if (normalizedSaleName === normalizedProductName && 
-        normalizedSaleCategory === normalizedProductCategory) {
-      return true;
-    }
-    
-    // Fuzzy match for similar names in same category
-    if (normalizedSaleCategory === normalizedProductCategory) {
-      return normalizedSaleName.includes(normalizedProductName) || 
-             normalizedProductName.includes(normalizedSaleName);
-    }
-    
-    return false;
+    return normalizedSaleCategory === normalizedProductCategory && 
+           (normalizedSaleName.includes(normalizedProductName) || 
+            normalizedProductName.includes(normalizedSaleName));
   });
 }
 
@@ -209,7 +248,16 @@ export function calculateAggregatedStockStats(
  * Get default initial stock date (today)
  */
 export function getDefaultInitialStockDate(): string {
-  return format(new Date(), 'yyyy-MM-dd');
+  try {
+    return format(new Date(), 'yyyy-MM-dd');
+  } catch (error) {
+    // Fallback in case of error
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
 }
 
 /**
@@ -218,7 +266,10 @@ export function getDefaultInitialStockDate(): string {
 export function formatStockDate(dateString: string): string {
   try {
     const date = parseISO(dateString);
-    return format(date, 'dd/MM/yyyy');
+    if (isValid(date)) {
+      return format(date, 'dd/MM/yyyy');
+    }
+    return dateString;
   } catch {
     return dateString;
   }
